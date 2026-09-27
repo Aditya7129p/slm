@@ -25,6 +25,15 @@ DDP design notes:
   - Only rank 0 writes checkpoints, logs, and inference checks.
   - All ranks must call optimizer.step() synchronously; non-rank-0 steps are
     a no-op in terms of side effects but required for NCCL synchronisation.
+
+Session management:
+  - SIGTERM (cell stop / kernel kill): caught alongside SIGINT — triggers an
+    emergency checkpoint before exiting cleanly.
+  - Auto-save timer: exits cleanly after SESSION_HOURS (default 8h 40min) so
+    the notebook cell finishes and you can copy the checkpoint to persistent
+    storage before the Kaggle session expires.
+  - Override the timer via the --session-hours flag:
+      torchrun --nproc_per_node=2 train_kaggle.py --session-hours 8.67
 """
 
 import os
@@ -32,6 +41,7 @@ import sys
 import gc
 import time
 import math
+import signal
 import argparse
 import contextlib
 
@@ -75,7 +85,7 @@ from config_kaggle import model_cfg, train_cfg
 from model import SLM
 from optimizer import build_optimizers, get_lr
 from dataset import make_data_generator
-from checkpoint import save_checkpoint, load_checkpoint, GracefulInterrupt
+from checkpoint import save_checkpoint, load_checkpoint
 from logger import TrainingLogger
 from inference import run_inference_check
 
@@ -84,6 +94,68 @@ try:
     _HAS_PSUTIL = True
 except ImportError:
     _HAS_PSUTIL = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Graceful shutdown handler — catches SIGINT (Ctrl+C) AND SIGTERM (cell stop)
+# ─────────────────────────────────────────────────────────────────────────────
+class _ShutdownHandler:
+    """
+    Sets a shared flag when SIGINT or SIGTERM is received.
+
+    Kaggle sends SIGTERM to child processes when you click the cell stop button
+    or interrupt the kernel. We catch it here so torchrun worker processes can
+    save a checkpoint before exiting instead of being killed mid-step.
+    """
+
+    def __init__(self):
+        self.interrupted = False
+        self._orig_sigint  = signal.getsignal(signal.SIGINT)
+        self._orig_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGINT,  self._handle)
+        signal.signal(signal.SIGTERM, self._handle)
+
+    def _handle(self, signum, frame):
+        sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+        # Only print on first signal to avoid console spam
+        if not self.interrupted:
+            print(f"\n[kaggle] {sig_name} received — finishing step and saving checkpoint …",
+                  flush=True)
+        self.interrupted = True
+
+    def restore(self):
+        signal.signal(signal.SIGINT,  self._orig_sigint)
+        signal.signal(signal.SIGTERM, self._orig_sigterm)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session timer — auto-exit before Kaggle's 12h wall-clock limit
+# ─────────────────────────────────────────────────────────────────────────────
+class _SessionTimer:
+    """
+    Triggers a clean checkpoint-and-exit after `hours` wall-clock time.
+
+    Kaggle GPU sessions expire at 12h. We exit at 8h40m (configurable) so
+    there is always ~3h20m left to copy checkpoints to persistent storage
+    (Kaggle dataset output) before the session dies.
+    """
+
+    def __init__(self, hours: float):
+        self._deadline = time.monotonic() + hours * 3600
+        self._fired    = False
+
+    @property
+    def expired(self) -> bool:
+        if not self._fired and time.monotonic() >= self._deadline:
+            self._fired = True
+            return True
+        return self._fired
+
+    def remaining_str(self) -> str:
+        secs = max(0.0, self._deadline - time.monotonic())
+        h, rem = divmod(int(secs), 3600)
+        m, s   = divmod(rem, 60)
+        return f"{h:02d}h{m:02d}m{s:02d}s"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,13 +258,14 @@ def _compute_val_loss(model, cfg, device, autocast, val_batches: int = 16) -> fl
 # ─────────────────────────────────────────────────────────────────────────────
 # Main training function
 # ─────────────────────────────────────────────────────────────────────────────
-def train(resume_path: str = None):
+def train(resume_path: str = None, session_hours: float = 8.667):
     cfg  = train_cfg
     mcfg = model_cfg
 
     # ── DDP init ─────────────────────────────────────────────────────────────
     rank, local_rank, world_size = _init_ddp()
     is_master = _is_master(rank)
+    session_timer = _SessionTimer(session_hours)
 
     if is_master:
         _hf_login()
@@ -211,6 +284,8 @@ def train(resume_path: str = None):
         print(f"[kaggle] rank={rank}  device={device}  dtype={dtype}")
         print(f"[kaggle] GPU: {props.name}  VRAM: {props.total_memory/1024**3:.1f} GB")
         print(f"[kaggle] world_size={world_size}  backend={cfg.ddp_backend}")
+        print(f"[kaggle] session timer: {session_hours:.2f}h  "
+              f"(auto-save + exit at T-{session_timer.remaining_str()})")
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = SLM(mcfg).to(device=device, dtype=dtype)
@@ -261,7 +336,7 @@ def train(resume_path: str = None):
         logger.start(n_params=n_params, vocab_size=mcfg.vocab_size)
 
     # ── Interrupt handler (rank 0 coordinates, others follow) ────────────────
-    interrupt = GracefulInterrupt()
+    interrupt = _ShutdownHandler()
 
     # ── Data generator — each rank gets an offset to avoid duplicate data ─────
     # Offset each rank by rank × (tokens_per_rank) from current position.
@@ -276,14 +351,28 @@ def train(resume_path: str = None):
     try:
         while step < cfg.max_steps:
 
-            # ── Interrupt check (broadcast from rank 0) ───────────────────────
-            interrupted_flag = torch.tensor(
-                [1 if interrupt.interrupted else 0], dtype=torch.int, device=device
-            )
-            dist.broadcast(interrupted_flag, src=0)
+            # ── Shutdown / timer check (broadcast from rank 0) ────────────────
+            # Combine interrupt flag (SIGINT/SIGTERM) and session timer into one
+            # tensor so we only need a single broadcast per step.
+            # Bit 0 = user interrupt,  Bit 1 = session timer expired
+            shutdown_reason = 0
+            if interrupt.interrupted:
+                shutdown_reason |= 1
+            if is_master and session_timer.expired:
+                shutdown_reason |= 2
 
-            if interrupted_flag.item() == 1:
+            shutdown_tensor = torch.tensor([shutdown_reason], dtype=torch.int, device=device)
+            dist.broadcast(shutdown_tensor, src=0)
+            shutdown_reason = shutdown_tensor.item()
+
+            if shutdown_reason != 0:
+                reason_str = (
+                    "SIGINT/SIGTERM received" if shutdown_reason & 1
+                    else "session timer expired (8h40m)"
+                )
                 if is_master:
+                    print(f"\n[kaggle] Stopping: {reason_str} — saving checkpoint …",
+                          flush=True)
                     logger.log_interrupt(step)
                     ckpt_path = save_checkpoint(
                         raw_model, muon_opt, adamw_opt,
@@ -291,6 +380,9 @@ def train(resume_path: str = None):
                         train_cfg=cfg,
                     )
                     logger.log_checkpoint(step, ckpt_path)
+                    print(f"[kaggle] Checkpoint saved → {ckpt_path}", flush=True)
+                    print(f"[kaggle] Copy this to persistent storage to resume next session.",
+                          flush=True)
                 dist.barrier()
                 break
 
@@ -349,6 +441,11 @@ def train(resume_path: str = None):
             adamw_opt.step()
 
             _check_memory()
+
+            # ── Periodic timed checkpoint reminder (rank 0 only) ──────────────
+            if is_master and step % 100 == 0:
+                print(f"[kaggle] session time remaining: {session_timer.remaining_str()}",
+                      flush=True)
 
             # ── Eval / checkpoint / logging (rank 0 only) ─────────────────────
             is_ckpt  = (step % cfg.save_every == 0)
@@ -441,6 +538,7 @@ def main():
             "  torchrun --nproc_per_node=2 train_kaggle.py\n"
             "  torchrun --nproc_per_node=2 train_kaggle.py --no-resume\n"
             "  torchrun --nproc_per_node=2 train_kaggle.py --resume checkpoints_kaggle/step-0005000\n"
+            "  torchrun --nproc_per_node=2 train_kaggle.py --session-hours 8.67\n"
         ),
     )
     parser.add_argument(
@@ -455,12 +553,23 @@ def main():
         action="store_true",
         help="Start training from scratch, ignoring existing checkpoints.",
     )
+    parser.add_argument(
+        "--session-hours",
+        type=float,
+        default=8.667,
+        metavar="HOURS",
+        help=(
+            "Auto-save checkpoint and exit after this many wall-clock hours. "
+            "Default: 8.667 (8h 40min). Kaggle sessions last 12h; the gap "
+            "gives time to copy checkpoints to persistent storage."
+        ),
+    )
     args = parser.parse_args()
 
     if args.no_resume:
         train_cfg.resume = False
 
-    train(resume_path=args.resume)
+    train(resume_path=args.resume, session_hours=args.session_hours)
 
 
 if __name__ == "__main__":
