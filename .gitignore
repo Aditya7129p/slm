@@ -1,0 +1,14 @@
+﻿# HuggingFace token — never commit this
+.env
+
+# Training artefacts
+checkpoints/
+logs/
+tokenizer/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
