@@ -78,10 +78,11 @@ def generate(
     model.eval()
     ctx_len  = model.cfg.context_len
     eos_id   = tokenizer.token_to_id("<eos>") or 3
+    device   = next(model.parameters()).device
 
     enc      = tokenizer.encode(prompt)
     ids      = enc.ids
-    in_tensor = torch.tensor([ids], dtype=torch.long)
+    in_tensor = torch.tensor([ids], dtype=torch.long, device=device)
 
     if stream:
         sys.stdout.write(prompt)
@@ -117,7 +118,7 @@ def generate(
         next_id  = torch.multinomial(probs, num_samples=1).item()
 
         generated_ids.append(next_id)
-        in_tensor = torch.cat([in_tensor, torch.tensor([[next_id]])], dim=1)
+        in_tensor = torch.cat([in_tensor, torch.tensor([[next_id]], device=device)], dim=1)
 
         if stream:
             token_str = tokenizer.decode([next_id])
