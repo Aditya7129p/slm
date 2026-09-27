@@ -1,7 +1,13 @@
 # SLM — Small Language Model
 
-A **7.3 M-parameter** transformer trained from scratch on your CPU.
-Built for Intel Core Ultra 5 225H + Iris iGPU, engineered to stay under **7 GB RAM**.
+A transformer trained **from scratch**, available in four configurations:
+
+| Config | Parameters | Context | Vocab | Target Hardware |
+|---|---|---|---|---|
+| `config.py` (default) | **~4 M** | 512 tokens | 8 192 | Any CPU, ≤ 7 GB RAM |
+| `config_100m.py` | **~98 M** | 1 024 tokens | 32 768 | Intel Core Ultra 5 225H, ≤ 8 GB RAM |
+| `config_colab.py` | **~4 M** | 512 tokens | 8 192 | Google Colab T4 / A100 |
+| `config_kaggle.py` | **~152 M** | 1 024 tokens | 32 768 | Kaggle 2× T4 (DDP) |
 
 ---
 
@@ -10,7 +16,7 @@ Built for Intel Core Ultra 5 225H + Iris iGPU, engineered to stay under **7 GB R
 1. [Architecture](#architecture)
 2. [Project Layout](#project-layout)
 3. [Quick Start](#quick-start)
-4. [Configuration](#configuration)
+4. [Configs](#configs)
 5. [Training](#training)
 6. [Resume & Checkpoints](#resume--checkpoints)
 7. [Inference](#inference)
@@ -22,34 +28,63 @@ Built for Intel Core Ultra 5 225H + Iris iGPU, engineered to stay under **7 GB R
 
 ## Architecture
 
+All configs share the same architecture family. Only the scale changes.
+
+### 4M config (`config.py`)
+
 | Hyperparameter | Value |
 |---|---|
-| Parameters | **7 342 336** |
-| Vocabulary | 8 192 tokens (BPE, English-only) |
+| Parameters | **~4 M** |
+| Vocabulary | 8 192 tokens (BPE) |
 | Context length | 512 tokens |
-| Embedding dim (`d_model`) | 256 |
-| Transformer layers | 8 |
-| Attention heads (Q) | 8 |
+| `d_model` | 288 |
+| Layers | 10 |
+| Q heads | 8 |
 | KV heads (GQA) | 2 |
-| FFN hidden dim (`d_ff`) | 640 |
-| Positional encoding | RoPE |
-| Activation | SwiGLU |
-| Normalization | RMSNorm |
-| Residual style | Parallel Attn + FFN (PaLM-style) |
-| Weight tying | embed ↔ lm\_head |
-| Bias | None |
+| `d_ff` | 768 |
 
-### Bleeding-edge techniques used
+### 100M config (`config_100m.py`)
 
-```
-RMSNorm          — no mean-centering, cheaper than LayerNorm
-RoPE             — relative positions, extrapolates to longer sequences
-GQA (4× KV)     — 8 Q-heads share 2 KV-heads; 4× KV memory savings
-SwiGLU           — gated activation; consistently outperforms GELU FFN
-Parallel blocks  — Attn and FFN run on the same pre-norm state (PaLM)
-Muon optimizer   — Newton-Schulz orthogonalised SGD for matrix weights
-Weight tying     — embed and lm_head share the same matrix (~2M saved)
-```
+| Hyperparameter | Value |
+|---|---|
+| Parameters | **~98 M** |
+| Vocabulary | 32 768 tokens (BPE) |
+| Context length | 1 024 tokens |
+| `d_model` | 768 |
+| Layers | 13 |
+| Q heads | 12 |
+| KV heads (GQA) | 3 |
+| `d_ff` | 2 048 |
+| dtype | bfloat16 (AVX-512 BF16) |
+
+### 150M config (`config_kaggle.py`) — Kaggle 2× T4 DDP
+
+| Hyperparameter | Value |
+|---|---|
+| Parameters | **~152 M** |
+| Vocabulary | 32 768 tokens (BPE) |
+| Context length | 1 024 tokens |
+| `d_model` | 960 |
+| Layers | 16 |
+| Q heads | 16 |
+| KV heads (GQA) | 4 |
+| `d_ff` | 2 560 |
+| DDP | 2× T4, NCCL backend |
+| Global eff. batch | 131 072 tokens/step |
+| dtype | bfloat16 |
+
+### Techniques used by all configs
+
+| Technique | Purpose |
+|---|---|
+| **RMSNorm** | No mean-centering — ~15 % cheaper than LayerNorm |
+| **RoPE** | Relative positions, extrapolates to longer sequences |
+| **GQA** | Q-heads share fewer KV-heads — 4× KV memory savings |
+| **SwiGLU** | Gated activation — consistently beats GELU on LM benchmarks |
+| **Parallel blocks** | Attn + FFN on same pre-norm state (PaLM-style), one fewer norm |
+| **Muon optimizer** | Newton-Schulz orthogonalised SGD for 2-D weight matrices |
+| **Weight tying** | `embed` and `lm_head` share the same matrix |
+| **Flash attention** | `F.scaled_dot_product_attention` — O(T) memory, not O(T²) |
 
 ---
 
@@ -57,33 +92,36 @@ Weight tying     — embed and lm_head share the same matrix (~2M saved)
 
 ```
 slm/
-├── config.py            ← All hyperparameters (single source of truth)
+├── config.py            ← Default 4M config (single source of truth)
+├── config_100m.py       ← 100M config for Intel Core Ultra 5 225H
+├── config_colab.py      ← Colab/GPU config (inherits 4M)
+├── config_kaggle.py     ← 150M config for Kaggle 2× T4 DDP
+│
 ├── model.py             ← SLM architecture (RoPE · GQA · SwiGLU · RMSNorm)
 ├── optimizer.py         ← Muon optimizer + AdamW companion + LR schedule
 ├── dataset.py           ← FineWeb-Edu streaming pipeline
 ├── logger.py            ← ANSI terminal logger + JSONL writer
 ├── checkpoint.py        ← Save / load + graceful Ctrl+C handler
-├── inference.py         ← Generation (top-k/p, rep-penalty, streaming)
-├── train.py             ← Main training loop
-├── tokenizer_train.py   ← BPE tokenizer training (run once)
+├── inference.py         ← Generation (top-k, temperature, streaming)
+├── train.py             ← Main training loop  (--config selects config)
+├── train_colab.py       ← Colab single-GPU entry point
+├── train_kaggle.py      ← Kaggle 2× T4 DDP entry point (torchrun)
+├── tokenizer_train.py   ← BPE tokenizer training  (--config selects config)
 ├── setup_check.py       ← Pre-flight verification script
+├── colab_train.ipynb    ← Google Colab notebook
+├── kaggle_notebook.ipynb← Kaggle notebook (2× T4 DDP)
 ├── requirements.txt
 │
-├── tokenizer/           ← Created by tokenizer_train.py
-│   ├── tokenizer.json
-│   └── config.json
+├── tokenizer/           ← Created by tokenizer_train.py  (4M config, vocab 8 192)
+├── tokenizer_100m/      ← Shared by 100M + 150M configs  (vocab 32 768)
 │
-├── checkpoints/         ← Created during training
-│   └── step-0000500/
-│       ├── model.pt
-│       ├── muon.pt
-│       ├── adamw.pt
-│       └── train_state.json
+├── checkpoints/         ← Default 4M checkpoints
+├── checkpoints_100m/    ← 100M checkpoints
+├── checkpoints_kaggle/  ← 150M Kaggle DDP checkpoints
 │
-└── logs/                ← Created during training
-    ├── log-1.jsonl
-    ├── log-2.jsonl
-    └── ...
+├── logs/                ← Default 4M JSONL logs
+├── logs_100m/           ← 100M JSONL logs
+└── logs_kaggle/         ← 150M Kaggle JSONL logs
 ```
 
 ---
@@ -96,8 +134,8 @@ slm/
 pip install -r requirements.txt
 ```
 
-> **PyTorch CPU build** is sufficient — no CUDA needed.
-> For faster matmuls, install the MKL-optimised wheel:
+> **PyTorch CPU build** is sufficient — no CUDA needed.  
+> For faster matmuls (MKL / AVX-512), use the official CPU wheel:
 > ```powershell
 > pip install torch --index-url https://download.pytorch.org/whl/cpu
 > ```
@@ -108,85 +146,126 @@ pip install -r requirements.txt
 python setup_check.py
 ```
 
-Expected output:
-```
-✔  Python 3.x.x
-✔  PyTorch 2.x.x
-✔  MKL available
-✔  tokenizers x.x
-✔  datasets x.x
-✔  psutil x.x
-ℹ  Total RAM : 15.4 GB
-ℹ  TOTAL estimate : ~240 MB  (0.23 GB)
-✔  Fits within 7.0 GB budget
-⚠  Tokenizer NOT found          ← expected on first run
-```
-
-### 3 — Train the tokenizer  *(once)*
+### 3 — Train the tokenizer *(once per config)*
 
 ```powershell
+# Default 4M config — vocab 8 192, saves to ./tokenizer/
 python tokenizer_train.py
-```
 
-This streams ~80 MB of FineWeb-Edu text and trains an 8 192-token BPE vocabulary.
-Takes roughly **5–10 minutes** on a home internet connection.
+# 100M config — vocab 32 768, saves to path set in config_100m.py
+python tokenizer_train.py --config config_100m
+
+# Overwrite an existing tokenizer
+python tokenizer_train.py --config config_100m --force
+```
 
 ### 4 — Start training
 
 ```powershell
+# Default 4M model
 python train.py
+
+# 100M model (Intel Core Ultra 5 225H)
+python train.py --config config_100m
+
+# 150M model on Kaggle (2× T4, DDP) — run inside kaggle_notebook.ipynb
+torchrun --nproc_per_node=2 train_kaggle.py
 ```
 
 ---
 
-## Configuration
+## Configs
 
-All knobs are in [`config.py`](config.py). The two dataclasses:
+### Selecting a config
 
-### `ModelConfig`
+Both `train.py` and `tokenizer_train.py` accept a `--config` / `-c` flag that takes any config **module name** (filename without `.py`) from the project root:
 
-| Field | Default | Description |
+```powershell
+python train.py --config config          # 4M  (default)
+python train.py --config config_100m     # 100M
+python train.py --config config_colab    # Colab
+```
+
+The config module must define `model_cfg` and `train_cfg` dataclass instances. Each config is fully self-contained — it sets its own `checkpoint_dir`, `log_dir`, `tokenizer_path`, `dtype`, and all hyperparameters.
+
+### Kaggle 150M DDP config (`config_kaggle.py`)
+
+| Field | Value | Description |
 |---|---|---|
-| `vocab_size` | 8192 | BPE vocabulary size |
-| `context_len` | 512 | Maximum sequence length |
-| `d_model` | 256 | Hidden / embedding dimension |
-| `n_heads` | 8 | Query attention heads |
-| `n_kv_heads` | 2 | Key/Value heads (GQA) |
-| `n_layers` | 8 | Transformer blocks |
-| `d_ff_mult` | 2.667 | FFN width multiplier |
-| `rope_base` | 10 000 | RoPE frequency base |
+| `d_model` | 960 | Hidden dimension |
+| `n_layers` | 16 | Transformer blocks |
+| `n_heads` | 16 | Query heads |
+| `n_kv_heads` | 4 | GQA KV heads (4× savings) |
+| `batch_size` | 8 | Per-GPU micro-batch |
+| `grad_accum_steps` | 8 | Steps before optimizer update |
+| `dtype` | `"bfloat16"` | Native T4 support |
+| `ddp_backend` | `"nccl"` | GPU-to-GPU communication |
+| `checkpoint_dir` | `checkpoints_kaggle` | Separate from other configs |
+| `tokenizer_path` | `tokenizer_100m` | Reuses 32 768-vocab tokenizer |
 
-### `TrainConfig`
+### Creating a new config
 
-| Field | Default | Description |
-|---|---|---|
-| `batch_size` | 4 | Sequences per micro-step |
-| `grad_accum_steps` | 8 | Effective batch = 4 × 8 = **32** |
-| `context_len` | 512 | Sequence length |
-| `lr` | 3e-3 | Peak learning rate (Muon) |
-| `weight_decay` | 0.1 | Decoupled L2 penalty |
-| `muon_momentum` | 0.95 | Nesterov momentum for Muon |
-| `warmup_steps` | 100 | Linear LR warmup |
-| `lr_decay_steps` | 50 000 | Cosine decay over N steps |
-| `max_steps` | 50 000 | Total optimizer steps |
-| `save_every` | 500 | Checkpoint interval |
-| `eval_every` | 50 | Inference check interval |
-| `grad_clip` | 1.0 | Gradient clipping norm |
-| `dataset_config` | `sample-10BT` | FineWeb-Edu subset |
+Copy any existing config file, rename it (e.g. `config_experiment.py`), and modify the values. Then:
+
+```powershell
+python train.py --config config_experiment
+```
+
+### `ModelConfig` fields
+
+| Field | 4M default | 100M default | Description |
+|---|---|---|---|
+| `vocab_size` | 8 192 | 32 768 | BPE vocabulary size |
+| `context_len` | 512 | 1 024 | Maximum sequence length |
+| `d_model` | 288 | 768 | Hidden / embedding dimension |
+| `n_heads` | 8 | 12 | Query attention heads |
+| `n_kv_heads` | 2 | 3 | KV heads (GQA) |
+| `n_layers` | 10 | 13 | Transformer blocks |
+| `d_ff_mult` | 2.667 | 2.667 | FFN width multiplier |
+| `dropout` | 0.0 | 0.1 | Dropout (0 = disabled) |
+| `rope_base` | 10 000 | 10 000 | RoPE frequency base |
+
+### `TrainConfig` fields
+
+| Field | 4M default | 100M default | Description |
+|---|---|---|---|
+| `batch_size` | 8 | 1 | Sequences per micro-step |
+| `grad_accum_steps` | 16 | 64 | Steps before optimizer update |
+| `context_len` | 512 | 1 024 | Must match `ModelConfig.context_len` |
+| `lr` | 3e-3 | 3e-3 | Peak LR (Muon) |
+| `warmup_steps` | 50 | 1 000 | Linear LR warmup |
+| `lr_decay_steps` | 50 000 | 50 000 | Cosine decay over N steps |
+| `min_lr_ratio` | 0.1 | 0.05 | Floor = `lr × min_lr_ratio` |
+| `max_steps` | 50 000 | 50 000 | Total optimizer steps |
+| `save_every` | 500 | 500 | Checkpoint interval |
+| `eval_every` | 50 | 200 | Val loss + inference interval |
+| `val_batches` | — | 16 | Micro-batches per val pass |
+| `grad_clip` | 1.0 | 1.0 | Gradient clipping norm |
+| `dtype` | `"auto"` | `"bfloat16"` | `"auto"` / `"float32"` / `"bfloat16"` |
+| `checkpoint_dir` | `checkpoints` | `checkpoints_100m` | Where to save checkpoints |
+| `log_dir` | `logs` | `logs_100m` | Where to write JSONL logs |
+| `tokenizer_path` | `tokenizer` | `tokenizer_100m` | Tokenizer directory |
 
 ---
 
 ## Training
 
 ```powershell
-# Start fresh
-python train.py
+# ── Default 4M config ────────────────────────────────────────────
+python train.py                                          # auto-resume
+python train.py --no-resume                              # from scratch
+python train.py --resume checkpoints/step-0001000        # specific checkpoint
 
-# Start fresh, ignoring any existing checkpoints
-python train.py --no-resume
+# ── 100M config (Intel Core Ultra 5 225H) ────────────────────────
+python train.py --config config_100m
+python train.py --config config_100m --no-resume
+python train.py --config config_100m --resume checkpoints_100m/step-0000500
 
-# Resume from a specific checkpoint
-python train.py --resume checkpoints/step-0001000
+# ── 150M config (Kaggle 2× T4 DDP) ──────────────────────────────
+# Run inside kaggle_notebook.ipynb, or:
+torchrun --nproc_per_node=2 train_kaggle.py
+torchrun --nproc_per_node=2 train_kaggle.py --no-resume
+torchrun --nproc_per_node=2 train_kaggle.py --resume checkpoints_kaggle/step-0005000
 ```
 
 ### What the terminal shows
@@ -196,34 +275,31 @@ python train.py --resume checkpoints/step-0001000
                     ✦  SLM Pre-Training  ✦
 ══════════════════════════════════════════════════════════════════
 
-  Parameters  :  7,342,336
-  Vocab size  :  8,192
+  Parameters  :  98,234,368
+  Vocab size  :  32,768
   Max steps   :  50,000
-  Grad accum  :  8
-  Log file    :  logs/log-1.jsonl
-  Memory      :  ████████░░░░░░░░░░░░ 4.1/15.4GB (27%)
+  Grad accum  :  64
+  Log file    :  logs_100m/log-1.jsonl
+  Memory      :  ███░░░░░░░░░░░░░░░░░ 2.1/15.4GB (14%)
 
 ──────────────────────────────────────────────────────────────────
-  STEP              LOSS          LR          GRAD NORM   TOKENS   …  TREND
-  ──────────────────────────────────────────────────────────────────
-  [     1/50000]    9.01234       3.00e-05    0.9821      16.4K    …  ▁
-  [     2/50000]    8.84521       6.00e-05    0.9134      32.8K    …  ▁▂
-  ...
-  [    50/50000] 🔍  7.23100       1.50e-03    0.7442      819.2K   …  ▁▂▃▄▄▅
-
-  ┌────────────────────────────────────────────────┐
-  │  🔍  Inference Check @ step 50
-  │
-  │  PROMPT:  The theory of relativity states that
-  │  MODEL :  the universe is a very large number of ...
-  └────────────────────────────────────────────────┘
+  STEP           LOSS       VAL LOSS   LR         GRAD NORM  …  TREND
+  ──────────────────────────────────────────────────────────────
+  [   1/50000]   10.8123    —          3.00e-06   0.9821     …  ▁
+  [   2/50000]   10.5431    —          6.00e-06   0.9134     …  ▁▂
+  [ 200/50000] 🔍 8.2341    8.4102     1.20e-03   0.7221     …  ▁▂▃▄▅▆
 ```
 
-- **Loss sparkline** — last 20 steps shown as Unicode block characters
-- **Memory gauge** — live RAM bar, turns yellow >65 %, red >85 %
-- **💾** next to step = checkpoint being saved
-- **🔍** next to step = inference check being run
-- **↩ Resuming** banner shown when continuing a previous run
+- **LOSS** — train loss, colour-coded green (decreasing) / yellow (plateau) / red (rising)
+- **VAL LOSS** — held-out validation loss, computed every `eval_every` steps; shows last known value (dimmed) between evaluations
+- **Trend sparkline** — last 16 train loss values as Unicode block characters
+- **Memory gauge** — live RAM bar, turns yellow > 65 %, red > 85 %
+- **💾** — checkpoint being saved at this step
+- **🔍** — inference check and validation pass being run at this step
+
+### Validation loss
+
+A separate data generator (starting from token 0) is used for validation — the training position is never advanced. Each eval pass processes `val_batches × batch_size × context_len` tokens. Both train loss and val loss are recorded in the JSONL log.
 
 ---
 
@@ -231,42 +307,31 @@ python train.py --resume checkpoints/step-0001000
 
 ### Automatic resume
 
-`train_cfg.resume = True` (default). On startup, `train.py` finds the **highest-numbered** `checkpoints/step-XXXXXXX/` directory and loads:
+`resume = True` (default in all configs). On startup, `train.py` finds the **highest-numbered** checkpoint directory inside `checkpoint_dir` and loads:
 
 ```
 model.pt          model weights
-muon.pt           Muon optimizer momentum buffers
+muon.pt           Muon momentum buffers
 adamw.pt          AdamW moment estimates
 train_state.json  step, tokens_consumed, torch RNG state
 ```
 
-Dataset position is recovered from `tokens_consumed` via document-skip heuristic (avg 512 tokens/doc).
+Dataset position is recovered from `tokens_consumed` via a document-skip heuristic.
 
 ### Ctrl+C — emergency save
 
-Press **Ctrl+C** at any point during training:
+Press **Ctrl+C** at any point:
 
 ```
   ⚡  Ctrl+C detected — saving emergency checkpoint …
-  💾 Checkpoint saved → checkpoints/step-0003217  (step 3217)
+  💾 Checkpoint saved → checkpoints_100m/step-0003217  (step 3217)
 ```
 
-The interrupt is caught between micro-steps so **no gradient update is lost**.
-Re-run `python train.py` to continue exactly from that step.
+The interrupt is caught between micro-steps so no partial gradient update is lost. Re-run the same command to continue from that exact step.
 
 ### Checkpoint retention
 
-Only the **3 most recent** checkpoints are kept (configurable via `keep_last_n` in [`checkpoint.py`](checkpoint.py)) to save disk space.
-
-### Manual checkpoint management
-
-```powershell
-# List checkpoints
-Get-ChildItem checkpoints
-
-# Resume from a specific one
-python train.py --resume checkpoints/step-0002000
-```
+Only the **3 most recent** checkpoints are kept (configurable via `keep_last_n` in [`checkpoint.py`](checkpoint.py)).
 
 ---
 
@@ -276,18 +341,6 @@ python train.py --resume checkpoints/step-0002000
 
 ```powershell
 python inference.py
-```
-
-```
-SLM Interactive Inference  (step 50,000)
-temperature=0.8  top_k=40  top_p=0.95
-
->>> The theory of relativity states that
-The theory of relativity states that space and time are not absolute ...
-
-[87 tokens  2.34s  37.2 tok/s]
-
->>> quit
 ```
 
 ### Single-shot
@@ -302,82 +355,109 @@ python inference.py --prompt "Once upon a time" --max-tokens 200
 |---|---|---|
 | `--checkpoint`, `-c` | latest | Path to checkpoint directory |
 | `--prompt`, `-p` | — | Single prompt (non-interactive) |
-| `--max-tokens`, `-m` | 200 | Max new tokens |
+| `--max-tokens`, `-m` | 200 | Max new tokens to generate |
 | `--temperature`, `-t` | 0.8 | Sampling temperature |
 | `--top-k`, `-k` | 40 | Top-K filter |
 | `--top-p` | 0.95 | Nucleus sampling threshold |
 | `--rep-penalty`, `-r` | 1.1 | Repetition penalty |
-| `--no-stream` | off | Print full output at once |
+| `--no-stream` | off | Print all at once instead of streaming |
 
 ---
 
 ## Logger & Logs
 
-### Terminal logger (`logger.py`)
+### Terminal columns
 
-The logger writes to `stdout` with full ANSI colour support (Windows 10+):
+| Column | Description |
+|---|---|
+| `STEP` | Current step / total, with 💾 / 🔍 badges |
+| `LOSS` | Train loss — green if falling, yellow if flat, red if rising |
+| `VAL LOSS` | Validation loss — same colour coding; dimmed when stale |
+| `LR` | Current learning rate |
+| `GRAD NORM` | Pre-clip gradient norm |
+| `TOKENS` | Cumulative tokens consumed |
+| `ELAPSED` | Wall-clock time since run start |
+| `ETA` | Estimated time remaining |
+| `TREND` | 16-char sparkline of recent train loss |
 
-- **Step row** — step/total, loss (colour-coded by trend), LR, grad norm, tokens, elapsed, ETA, sparkline
-- **Memory warning** — printed every 10 steps if RAM > 80 %
-- **Inference block** — framed box showing prompt and generated text
-- **Checkpoint notice** — path and step number
+### JSONL log files
 
-### JSONL log files (`logs/log-N.jsonl`)
-
-Each training run creates a **new** `log-N.jsonl` file (N increments automatically).
-Each line is a JSON object:
+Each run writes a new `logs/log-N.jsonl` (or `logs_100m/log-N.jsonl`). Every line is a JSON object.
 
 **Step record:**
 ```json
-{"step": 100, "loss": 7.12345, "lr": 0.003, "grad_norm": 0.8821,
- "tokens_total": 1638400, "elapsed_s": 142.3,
- "is_checkpoint": false, "is_inference": true}
+{
+  "step": 200,
+  "loss": 8.23410,
+  "val_loss": 8.41020,
+  "lr": 0.0012,
+  "grad_norm": 0.7221,
+  "tokens_total": 13107200,
+  "elapsed_s": 843.1,
+  "is_checkpoint": false,
+  "is_inference": true
+}
 ```
+
+> `val_loss` is `null` on steps where validation was not run.
 
 **Inference record:**
 ```json
-{"step": 100, "type": "inference",
- "prompt": "The theory of relativity states that",
- "generated": "The theory of relativity states that space and time ..."}
+{
+  "step": 200,
+  "type": "inference",
+  "prompt": "The theory of relativity states that",
+  "generated": "The theory of relativity states that space and time are ..."
+}
 ```
 
-Parse logs with standard tools:
-
+**Parse logs:**
 ```python
 import json
-with open("logs/log-1.jsonl") as f:
+
+with open("logs_100m/log-1.jsonl") as f:
     records = [json.loads(line) for line in f]
-losses = [r["loss"] for r in records if "loss" in r]
+
+train_loss = [(r["step"], r["loss"]) for r in records if "loss" in r]
+val_loss   = [(r["step"], r["val_loss"]) for r in records
+              if r.get("val_loss") is not None]
 ```
 
 ---
 
 ## Memory Budget
 
-Target: **≤ 7 GB** process RAM (Windows uses ~7.7 GB baseline on a 15.4 GB system).
+### 4M config (float32, batch=8, seq=512)
 
 | Component | Size |
 |---|---|
-| Model weights (float32) | ~28 MB |
-| Gradients | ~28 MB |
-| Muon momentum buffers | ~22 MB |
-| AdamW m + v buffers | ~34 MB |
-| Activations (batch=4, seq=512) | ~20 MB |
-| PyTorch overhead + datasets cache | ~200 MB |
-| **Total estimate** | **~330 MB** |
+| Model weights | ~11 MB |
+| Gradients | ~11 MB |
+| Muon momentum | ~8 MB |
+| AdamW m + v | ~13 MB |
+| Activations | ~20 MB |
+| PyTorch + datasets overhead | ~400 MB |
+| **Total estimate** | **~460 MB** |
 
-The model itself is extremely lightweight. The bulk of your 7 GB budget is consumed by:
-- Python interpreter + stdlib (~100 MB)
-- HuggingFace `datasets` + streaming cache (~200–400 MB)
-- Windows process overhead (~50 MB)
+### 100M config (bfloat16, batch=1, seq=1024)
 
-To **reduce** memory further:
-```python
-# config.py
-train_cfg.batch_size = 2        # halves activation memory
-train_cfg.context_len = 256     # quarters activation memory
-train_cfg.grad_accum_steps = 16 # compensate for smaller batch
-```
+| Component | Size |
+|---|---|
+| Model weights | ~198 MB |
+| Gradients | ~198 MB |
+| Muon momentum | ~148 MB |
+| AdamW m + v (embed/norm only) | ~51 MB |
+| Activations (flash-attn, O(T·d)) | ~20 MB |
+| Python / PyTorch / dataset overhead | ~800 MB |
+| **Total estimate** | **~1 415 MB (~1.4 GB)** |
+
+> The 100M config uses **bfloat16** throughout, cutting weight + gradient memory in half vs float32.  
+> Intel Core Ultra 5 225H (Meteor Lake) has native **AVX-512 BF16** units giving ~1.5–2× throughput over float32.  
+> If you see `NaN` or `inf` losses, add `dtype = "float32"` to your config.
+
+### Why context_len=1024 fits in 8 GB
+
+PyTorch ≥ 2.0 uses a **memory-efficient attention kernel** for `scaled_dot_product_attention` on CPU, keeping attention memory O(T·d) instead of O(T²). Without this, a T=1024, B=1, 12-head model would need ~50 MB per layer just for attention scores; with the kernel it's negligible.
 
 ---
 
@@ -385,38 +465,40 @@ train_cfg.grad_accum_steps = 16 # compensate for smaller batch
 
 ### Why Muon instead of AdamW for matrix weights?
 
-Muon orthogonalises the gradient update via Newton-Schulz iterations, approximating steepest descent in spectral norm. This gives better loss-per-step than AdamW at the same wall-clock cost on CPU, especially for small models where the Newton-Schulz iterations (5 passes over a small matrix) are cheap.
+Muon orthogonalises the gradient update via Newton-Schulz iterations, approximating steepest descent in spectral norm. This gives better loss-per-step than AdamW at the same wall-clock cost — especially on CPU where the Newton-Schulz passes over small matrices are cheap. Embed / norm parameters still use AdamW; Muon only applies to 2-D weight matrices.
 
-Embed / norm / bias parameters still use AdamW — Muon only makes sense for 2-D weight matrices.
+### Why GQA?
 
-### Why GQA (2 KV heads for 8 Q heads)?
+At 4× KV compression, KV projection and KV cache shrink substantially with minimal perplexity cost. In the 100M config, 12 Q-heads share 3 KV-heads (4× rep factor), saving ~25 % of attention parameters and speeding up both training and inference.
 
-At 4× KV compression, the KV projection and KV cache shrink substantially with minimal perplexity cost. Especially beneficial during inference where KV tensors grow with sequence length.
+### Why Parallel blocks (PaLM-style)?
 
-### Why Parallel blocks?
-
-In the standard Llama/GPT-2 style, each block does:
+Standard Llama-style blocks apply norm twice per block:
 ```
 x = x + Attn(norm(x))
 x = x + FFN(norm(x))
 ```
-The parallel (PaLM) style does:
+Parallel blocks apply it once:
 ```
 x = x + Attn(norm(x)) + FFN(norm(x))
 ```
-One `norm` call per block instead of two, and better gradient flow for small models.
+One fewer RMSNorm call per block, and better gradient flow on small-to-medium models.
 
 ### Why SwiGLU?
 
-SwiGLU consistently outperforms ReLU and GELU on language modelling benchmarks. The gating mechanism (`silu(gate(x)) * up(x)`) acts as a learned feature selector at each FFN position.
+SwiGLU consistently outperforms ReLU and GELU on language modelling. The gating mechanism (`silu(gate(x)) * up(x)`) acts as a learned per-position feature selector inside the FFN.
 
-### Why RMSNorm instead of LayerNorm?
+### Why RMSNorm?
 
-RMSNorm skips the mean-centering step, making it ~15 % faster. For small models the difference in training stability is negligible, but the speed improvement is free.
+RMSNorm skips mean-centering, making it ~15 % faster than LayerNorm with negligible effect on training stability at this scale.
 
 ### Why streaming dataset?
 
-FineWeb-Edu is ~250 GB uncompressed. Downloading it fully is impractical. Streaming processes one document at a time with no local cache beyond what HuggingFace buffers (~a few hundred MB), keeping disk usage near zero.
+FineWeb-Edu is ~250 GB uncompressed. Streaming processes one document at a time with no local cache beyond HuggingFace's buffer (~a few hundred MB), keeping disk usage near zero.
+
+### Why bfloat16 on the 100M config?
+
+Intel Core Ultra 5 225H (Meteor Lake) includes AVX-512 BF16 VNNI instructions that accelerate bfloat16 matrix multiplications natively. PyTorch's MKL/oneDNN backend uses these automatically, giving ~1.5–2× throughput over float32 with the same numerical range (8-bit exponent, vs float16's 5-bit exponent — no loss scaling needed).
 
 ---
 

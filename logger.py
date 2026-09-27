@@ -158,16 +158,17 @@ class TrainingLogger:
         grad_accum_steps: int,
         resume_step: int = 0,
     ):
-        self.log_dir         = log_dir
-        self.total_steps     = total_steps
-        self.grad_accum      = grad_accum_steps
-        self.step            = resume_step
-        self.start_time      = time.time()
-        self.last_log_time   = self.start_time
-        self._loss_history: List[float] = []
-        self._log_path       = _get_log_path(log_dir)
-        self._log_file       = open(self._log_path, "a", buffering=1)
-        self._header_printed = 0
+        self.log_dir          = log_dir
+        self.total_steps      = total_steps
+        self.grad_accum       = grad_accum_steps
+        self.step             = resume_step
+        self.start_time       = time.time()
+        self.last_log_time    = self.start_time
+        self._loss_history:    List[float] = []
+        self._val_loss_history: List[float] = []
+        self._log_path        = _get_log_path(log_dir)
+        self._log_file        = open(self._log_path, "a", buffering=1)
+        self._header_printed  = 0
 
     # ── Banner ────────────────────────────────────────────────────────────────
     def start(self, n_params: int = 0, vocab_size: int = 0):
@@ -199,6 +200,7 @@ class TrainingLogger:
         hdr = (
             f"  {_c('STEP', C.DIM, C.BOLD):<18}"
             f"  {_c('LOSS', C.DIM, C.BOLD):<14}"
+            f"  {_c('VAL LOSS', C.DIM, C.BOLD):<14}"
             f"  {_c('LR', C.DIM, C.BOLD):<14}"
             f"  {_c('GRAD NORM', C.DIM, C.BOLD):<14}"
             f"  {_c('TOKENS', C.DIM, C.BOLD):<14}"
@@ -227,6 +229,7 @@ class TrainingLogger:
         tokens_total: int,
         is_checkpoint: bool = False,
         is_inference: bool = False,
+        val_loss: Optional[float] = None,
     ):
         self.step = step
         self._loss_history.append(loss)
@@ -241,12 +244,28 @@ class TrainingLogger:
             self._print_header()
             self._header_printed = step
 
-        # Loss colour
+        # Train loss colour (based on recent trend)
         if len(self._loss_history) >= 5:
             trend = self._loss_history[-1] - sum(self._loss_history[-5:-1]) / 4
             loss_col = C.GREEN if trend < 0 else (C.YELLOW if trend < 0.01 else C.RED)
         else:
             loss_col = C.WHITE
+
+        # Val loss colour
+        if val_loss is not None:
+            self._val_loss_history.append(val_loss)
+            if len(self._val_loss_history) >= 2:
+                val_trend = self._val_loss_history[-1] - self._val_loss_history[-2]
+                val_col = C.GREEN if val_trend < 0 else (C.YELLOW if val_trend < 0.02 else C.RED)
+            else:
+                val_col = C.WHITE
+            val_str = _c(f'{val_loss:.5f}', val_col, C.BOLD)
+        else:
+            # Show last known val loss dimmed, or placeholder
+            if self._val_loss_history:
+                val_str = _c(f'{self._val_loss_history[-1]:.5f}', C.DIM)
+            else:
+                val_str = _c("   —   ", C.DIM)
 
         spark = _sparkline(self._loss_history, width=16)
 
@@ -262,6 +281,7 @@ class TrainingLogger:
         row = (
             f"  {_c(f'[{step:>6}/{self.total_steps}]', C.BOLD)}{step_tag}  "
             f"  {_c(f'{loss:.5f}', loss_col, C.BOLD):<22}"
+            f"  {val_str:<22}"
             f"  {_c(f'{lr:.2e}', C.BLUE):<22}"
             f"  {_c(f'{grad_norm:.4f}', C.MAGENTA):<22}"
             f"  {_c(_fmt_tokens(tokens_total), C.YELLOW):<22}"
@@ -282,6 +302,7 @@ class TrainingLogger:
         record = {
             "step":          step,
             "loss":          round(loss, 6),
+            "val_loss":      round(val_loss, 6) if val_loss is not None else None,
             "lr":            round(lr, 8),
             "grad_norm":     round(grad_norm, 6),
             "tokens_total":  tokens_total,
@@ -342,6 +363,8 @@ class TrainingLogger:
         print(f"  Total time    : {_fmt_time(elapsed)}")
         if self._loss_history:
             print(f"  Final loss    : {self._loss_history[-1]:.5f}")
+        if self._val_loss_history:
+            print(f"  Final val loss: {self._val_loss_history[-1]:.5f}")
         print()
         sys.stdout.flush()
 

@@ -2,14 +2,21 @@
 SLM Pre-Training  —  main entry point.
 
 Run:
-    python train.py
+    python train.py                          # default config  (config.py)
+    python train.py --config config_100m     # 100M param config
+    python train.py --config config_colab    # Colab config
 
 Stop cleanly:
-    Ctrl+C  →  saves emergency checkpoint and exits gracefully.
+    Ctrl+C  -> saves emergency checkpoint and exits gracefully.
 
 Resume:
-    python train.py          (auto-detects latest checkpoint)
+    python train.py                          # auto-resume from latest checkpoint
     python train.py --resume checkpoints/step-0001000
+    python train.py --config config_100m --resume checkpoints_100m/step-0001000
+
+No-resume (train from scratch):
+    python train.py --no-resume
+    python train.py --config config_100m --no-resume
 
 HuggingFace token (optional but recommended):
     Set HF_TOKEN in environment  OR  put it in a .env file:
@@ -61,14 +68,53 @@ from pathlib import Path
 
 import torch
 
+# ── CPU thread optimisation ────────────────────────────────────────────────
+# Pin PyTorch to use all physical (P-core) threads.
+# Intel Ultra 5 225H: 4 P-cores (HT=8 threads) + 8 E-cores (no HT=8 threads)
+# Using all 16 logical threads for matmuls is optimal for bfloat16 on AVX-512.
+# Override by setting OMP_NUM_THREADS before launching if needed.
+if not os.environ.get("OMP_NUM_THREADS"):
+    import multiprocessing
+    _n_cpu = multiprocessing.cpu_count()   # 16 on Ultra 5 225H
+    torch.set_num_threads(_n_cpu)
+    torch.set_num_interop_threads(2)       # 2 for lightweight inter-op parallelism
+    os.environ["OMP_NUM_THREADS"]       = str(_n_cpu)
+    os.environ["MKL_NUM_THREADS"]       = str(_n_cpu)
+    os.environ["GOMP_SPINCOUNT"]        = "0"  # avoid busy-wait on E-cores
+
 # ── Project imports ────────────────────────────────────────────────────────
-from config import model_cfg, train_cfg
 from model import SLM
 from optimizer import build_optimizers, get_lr
 from dataset import make_data_generator
 from checkpoint import save_checkpoint, load_checkpoint, GracefulInterrupt
 from logger import TrainingLogger
 from inference import run_inference_check
+
+
+# ── Config loader ─────────────────────────────────────────────────────────
+def _load_config(config_module: str):
+    """
+    Dynamically import model_cfg and train_cfg from any config module.
+
+    Examples:
+        _load_config("config")         -> config.py       (4M default)
+        _load_config("config_100m")    -> config_100m.py  (100M)
+        _load_config("config_colab")   -> config_colab.py (Colab)
+
+    The module name should be the bare filename without .py, resolvable
+    from the project root (same directory as train.py).
+    """
+    import importlib
+    try:
+        mod = importlib.import_module(config_module)
+    except ModuleNotFoundError:
+        print(f"[train] ✗  Config module '{config_module}' not found.")
+        print(f"[train]    Expected a file named '{config_module}.py' in the project root.")
+        raise SystemExit(1)
+    if not hasattr(mod, "model_cfg") or not hasattr(mod, "train_cfg"):
+        print(f"[train] ✗  '{config_module}.py' must define both 'model_cfg' and 'train_cfg'.")
+        raise SystemExit(1)
+    return mod.model_cfg, mod.train_cfg
 
 # ── Optional: psutil for memory monitoring ─────────────────────────────────
 try:
@@ -106,6 +152,35 @@ def _make_autocast(device: torch.device, dtype: torch.dtype):
     if device.type == "mps":
         return torch.amp.autocast(device_type="mps", dtype=dtype)
     return contextlib.nullcontext()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation loss
+# ─────────────────────────────────────────────────────────────────────────────
+@torch.no_grad()
+def _compute_val_loss(model, cfg, device, autocast, val_batches: int = 20) -> float:
+    """
+    Evaluate the model on a freshly-started stream slice.
+    Uses a separate generator so training position is not advanced.
+    Returns mean cross-entropy loss over `val_batches` micro-batches.
+    """
+    model.eval()
+    val_gen   = make_data_generator(cfg, skip_tokens=0)
+    total_loss = 0.0
+    count      = 0
+    for _ in range(val_batches):
+        try:
+            x, y, _ = next(val_gen)
+        except StopIteration:
+            break
+        x = x.to(device)
+        y = y.to(device)
+        with autocast:
+            _, loss = model(x, y)
+        total_loss += loss.item()
+        count      += 1
+    model.train()
+    return total_loss / max(1, count)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -161,7 +236,14 @@ def _load_tokenizer(path: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # Main training function
 # ─────────────────────────────────────────────────────────────────────────────
-def train(resume_path: str = None):
+def train(resume_path: str = None, model_cfg=None, train_cfg=None):
+    # Fall back to the module-level defaults when called without explicit configs
+    # (keeps backward compatibility with any external callers)
+    if model_cfg is None or train_cfg is None:
+        from config import model_cfg as _mcfg, train_cfg as _tcfg
+        model_cfg = _mcfg
+        train_cfg = _tcfg
+
     cfg       = train_cfg
     mcfg      = model_cfg
 
@@ -304,10 +386,16 @@ def train(resume_path: str = None):
             # ── Memory guard ─────────────────────────────────────────────────
             _check_memory(logger, step)
 
-            # ── Logging ──────────────────────────────────────────────────────
-            is_ckpt = (step % cfg.save_every == 0)
-            is_inf  = (step % cfg.eval_every == 0) and tokenizer is not None
+            # ── Validation loss (at eval_every cadence) ───────────────────────
+            is_ckpt  = (step % cfg.save_every == 0)
+            is_eval  = (step % cfg.eval_every == 0)
+            is_inf   = is_eval and tokenizer is not None
+            val_loss = None
+            if is_eval:
+                val_batches = getattr(cfg, "val_batches", 20)
+                val_loss = _compute_val_loss(model, cfg, device, autocast, val_batches)
 
+            # ── Logging ──────────────────────────────────────────────────────
             if step % cfg.log_every == 0:
                 logger.log_step(
                     step=step,
@@ -317,6 +405,7 @@ def train(resume_path: str = None):
                     tokens_total=tokens_consumed,
                     is_checkpoint=is_ckpt,
                     is_inference=is_inf,
+                    val_loss=val_loss,
                 )
 
             # ── Periodic checkpoint ───────────────────────────────────────────
@@ -378,14 +467,40 @@ def train(resume_path: str = None):
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="SLM Pre-Training")
+    parser = argparse.ArgumentParser(
+        description="SLM Pre-Training",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python train.py                            # default 4M config\n"
+            "  python train.py --config config_100m       # 100M param model\n"
+            "  python train.py --config config_colab      # Colab config\n"
+            "  python train.py --config config_100m --no-resume   # train from scratch\n"
+            "  python train.py --config config_100m --resume checkpoints_100m/step-0000500\n"
+        ),
+    )
+    parser.add_argument(
+        "--config", "-c",
+        type=str,
+        default="config",
+        metavar="MODULE",
+        help=(
+            "Config module to load (default: 'config'). "
+            "Pass the filename without .py, e.g. --config config_100m. "
+            "The file must be in the same directory as train.py and must "
+            "define 'model_cfg' and 'train_cfg'."
+        ),
+    )
     parser.add_argument(
         "--resume", "-r",
         type=str,
         default=None,
         metavar="CHECKPOINT_DIR",
-        help="Path to a specific checkpoint directory to resume from. "
-             "If omitted, auto-resumes from the latest checkpoint (if any).",
+        help=(
+            "Path to a specific checkpoint directory to resume from. "
+            "If omitted, auto-resumes from the latest checkpoint in the "
+            "config's checkpoint_dir (if resume=True in the config)."
+        ),
     )
     parser.add_argument(
         "--no-resume",
@@ -394,10 +509,15 @@ def main():
     )
     args = parser.parse_args()
 
+    model_cfg, train_cfg = _load_config(args.config)
+
+    print(f"[train] Using config: {args.config}.py  "
+          f"(checkpoint_dir='{train_cfg.checkpoint_dir}')")
+
     if args.no_resume:
         train_cfg.resume = False
 
-    train(resume_path=args.resume)
+    train(resume_path=args.resume, model_cfg=model_cfg, train_cfg=train_cfg)
 
 
 if __name__ == "__main__":

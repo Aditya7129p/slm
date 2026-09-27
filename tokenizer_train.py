@@ -1,25 +1,42 @@
 """
-Train a small BPE tokenizer (8 192 tokens, English-only) on FineWeb-Edu.
-Run once:  python tokenizer_train.py
-The tokenizer is saved to  ./tokenizer/  and reused by all other scripts.
+Train a BPE tokenizer on FineWeb-Edu.
+
+Run once per config (vocab sizes may differ between configs):
+    python tokenizer_train.py                    # default config (config.py)
+    python tokenizer_train.py --config config_100m  # 100M config (vocab=32768)
+
+The tokenizer is saved to the path specified by train_cfg.tokenizer_path
+(e.g. ./tokenizer/ or ./tokenizer_100m/) and reused by train.py.
+Pass --force to overwrite an existing tokenizer.
 """
 import os
 import sys
 import json
-import itertools
+import argparse
+import importlib
 from pathlib import Path
 
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, processors
 from datasets import load_dataset
 
-from config import train_cfg
-
-SAVE_DIR = Path(train_cfg.tokenizer_path)
-VOCAB_SIZE = train_cfg.tokenizer_vocab_size
-SAMPLE_CHARS = 80_000_000   # ~80 MB of text for tokenizer training (fast & sufficient)
+SAMPLE_CHARS = 80_000_000   # ~80 MB of text — fast & sufficient for BPE training
 
 
-def iter_texts(n_chars: int = SAMPLE_CHARS):
+def _load_config(config_module: str):
+    """Import model_cfg / train_cfg from any config file (no .py suffix)."""
+    try:
+        mod = importlib.import_module(config_module)
+    except ModuleNotFoundError:
+        print(f"[tokenizer] ✗  Config module '{config_module}' not found.")
+        print(f"[tokenizer]    Expected '{config_module}.py' in the project root.")
+        raise SystemExit(1)
+    if not hasattr(mod, "train_cfg"):
+        print(f"[tokenizer] ✗  '{config_module}.py' must define 'train_cfg'.")
+        raise SystemExit(1)
+    return mod.train_cfg
+
+
+def iter_texts(train_cfg, n_chars: int = SAMPLE_CHARS):
     """Stream FineWeb-Edu texts until we have enough characters."""
     ds = load_dataset(
         train_cfg.dataset_name,
@@ -55,7 +72,7 @@ CHAT_SPECIAL_TOKENS = [
 ]
 
 
-def build_tokenizer() -> Tokenizer:
+def build_tokenizer(train_cfg) -> Tokenizer:
     tokenizer = Tokenizer(models.BPE(unk_token="<unk>"))
 
     # Byte-level pre-tokenizer (handles Unicode robustly, keeps spaces)
@@ -66,14 +83,14 @@ def build_tokenizer() -> Tokenizer:
     special_tokens = ["<unk>", "<pad>", "<bos>", "<eos>"] + CHAT_SPECIAL_TOKENS
 
     trainer = trainers.BpeTrainer(
-        vocab_size=VOCAB_SIZE,
+        vocab_size=train_cfg.tokenizer_vocab_size,
         special_tokens=special_tokens,
         min_frequency=2,
         show_progress=True,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
 
-    tokenizer.train_from_iterator(iter_texts(), trainer=trainer)
+    tokenizer.train_from_iterator(iter_texts(train_cfg), trainer=trainer)
 
     # Post-processor: prepend <bos> automatically for plain (non-chat) encoding
     bos_id = tokenizer.token_to_id("<bos>")
@@ -88,15 +105,49 @@ def build_tokenizer() -> Tokenizer:
 
 
 def main():
-    if SAVE_DIR.exists() and (SAVE_DIR / "tokenizer.json").exists():
-        print(f"[tokenizer] Already exists at {SAVE_DIR} — skipping training.")
-        print("[tokenizer] Delete the directory to retrain.")
+    parser = argparse.ArgumentParser(
+        description="Train a BPE tokenizer for SLM",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python tokenizer_train.py                       # default config\n"
+            "  python tokenizer_train.py --config config_100m  # 100M config\n"
+            "  python tokenizer_train.py --force               # overwrite existing\n"
+        ),
+    )
+    parser.add_argument(
+        "--config", "-c",
+        type=str,
+        default="config",
+        metavar="MODULE",
+        help=(
+            "Config module to load (default: 'config'). "
+            "Pass the filename without .py, e.g. --config config_100m."
+        ),
+    )
+    parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Overwrite an existing tokenizer instead of skipping.",
+    )
+    args = parser.parse_args()
+
+    train_cfg = _load_config(args.config)
+    SAVE_DIR   = Path(train_cfg.tokenizer_path)
+    VOCAB_SIZE = train_cfg.tokenizer_vocab_size
+
+    print(f"[tokenizer] Using config: {args.config}.py  "
+          f"(save_dir='{SAVE_DIR}', vocab={VOCAB_SIZE:,})")
+
+    if not args.force and SAVE_DIR.exists() and (SAVE_DIR / "tokenizer.json").exists():
+        print(f"[tokenizer] Already exists at {SAVE_DIR} — skipping.")
+        print("[tokenizer] Pass --force to overwrite.")
         return
 
     print(f"[tokenizer] Training BPE tokenizer  vocab={VOCAB_SIZE:,} …")
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-    tok = build_tokenizer()
+    tok = build_tokenizer(train_cfg)
     tok.save(str(SAVE_DIR / "tokenizer.json"))
 
     # Save config — includes chat special token IDs for fast lookup
