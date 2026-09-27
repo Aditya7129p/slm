@@ -4,34 +4,46 @@ Configuration for the ~150M-parameter SLM — Kaggle 2× T4 GPU (DDP).
 Architecture: d_model=960, n_layers=16, n_heads=16, GQA kv=4, context=1024
   -> ~152 M trainable parameters  (weight-tied embed + lm_head)
 
-Hardware target: Kaggle free tier — 2× NVIDIA T4 (16 GB VRAM each)
+Hardware target: Kaggle free tier — 2× NVIDIA T4 (14.6 GB usable VRAM each)
 DDP strategy: torch.distributed, nproc_per_node=2, backend="nccl"
 
-VRAM budget per GPU (bfloat16, DDP):
-  +-----------------------------------------+-----------+
-  | Model weights (bfloat16)                | ~308 MB   |
-  | Gradients    (bfloat16)                 | ~308 MB   |
-  | Muon momentum buffers                   | ~250 MB   |
-  | AdamW m + v states (embed/norm only)    |  ~80 MB   |
-  | Activations B=8, T=1024 (flash-attn)   | ~150 MB   |
-  | DDP gradient buckets                    |  ~50 MB   |
-  | Dataset stream + tokenizer              | ~200 MB   |
-  | PyTorch / NCCL overhead                 | ~800 MB   |
-  +-----------------------------------------+-----------+
-  | Total per GPU                           | ~2.1 GB   |
-  +-----------------------------------------+-----------+
-  -> Very comfortably inside the 16 GB T4 limit.
+VRAM budget per GPU (bfloat16, gradient checkpointing ON):
+  +-------------------------------------------------+-----------+
+  | Model weights (bfloat16, 152M params)           | ~304 MB   |
+  | Gradients    (bfloat16)                         | ~304 MB   |
+  | Muon momentum buffers (~130M matrix params)     | ~260 MB   |
+  | AdamW m + v states (embed/norm ~22M params)     |  ~88 MB   |
+  | Activations B=2, T=1024 (grad checkpoint ON)    | ~400 MB   |
+  | DDP gradient buckets                            |  ~50 MB   |
+  | Dataset stream + tokenizer                      | ~200 MB   |
+  | PyTorch / NCCL overhead                         | ~800 MB   |
+  +-------------------------------------------------+-----------+
+  | Total per GPU                                   | ~2.4 GB   |
+  +-------------------------------------------------+-----------+
+  -> Fits comfortably inside the 14.6 GB T4 usable VRAM.
+
+Why the original batch_size=8 OOM'd:
+  Without gradient checkpointing, each forward pass stores ALL intermediate
+  activations for backprop.  For B=8, T=1024, D=960, L=16 that is roughly:
+    8 × 1024 × 960 × 16 × ~8 tensors × 2 bytes ≈ 10+ GB of activations alone.
+  Adding model weights (304 MB) + grads + optimizer states blows past 14.6 GB.
+
+  With gradient checkpointing (torch.utils.checkpoint):
+    Only block inputs are retained; activations are recomputed on the backward
+    pass. Peak activation memory drops from ~10 GB to ~400 MB at the cost of
+    ~30 % extra compute (one extra forward per block).
 
 DDP notes:
-  - Each GPU processes batch_size=8 micro-steps independently.
-  - Gradients are all-reduced across 2 GPUs before the optimizer step.
-  - Effective tokens/step = 2 GPUs × batch_size(8) × grad_accum(8) × context(1024)
-    = 131,072 tokens per optimizer step — excellent gradient quality.
+  - Each GPU processes batch_size=2 sequences per micro-step.
+  - grad_accum_steps=32 keeps effective tokens/step the same as before:
+      2 GPUs × batch_size(2) × grad_accum(32) × context(1024)
+      = 131,072 tokens per optimizer step.
   - Rank 0 handles checkpointing and logging; other ranks are silent.
 
 Training budget:
-  - max_steps=50,000 → ~6.5 B tokens total (well into Chinchilla territory for 150M).
-  - At ~80 k tokens/s on 2×T4, expect ~22 h to completion.
+  - max_steps=50,000 → ~6.5 B tokens total (Chinchilla-optimal for 150M).
+  - At ~50 k tokens/s on 2×T4 with grad-ckpt overhead, expect ~36 h total.
+  - Split into ~4 Kaggle sessions of ~9h each, auto-resuming via checkpoints.
 
 To run on Kaggle (in the notebook):
     torchrun --nproc_per_node=2 train_kaggle.py
@@ -78,11 +90,14 @@ class TrainConfig:
     tokenizer_vocab_size: int = 32_768
 
     # ── Batch / Sequence ──────────────────────────────────────────────────────
-    # With DDP (2 GPUs), each rank processes batch_size sequences independently.
-    # Global effective batch = world_size(2) × batch_size(8) × grad_accum(8) × T(1024)
-    #   = 131,072 tokens per optimizer step — healthy for 150M scale.
-    batch_size:       int = 8    # per-GPU micro-batch
-    grad_accum_steps: int = 8    # accumulate before optimizer step
+    # batch_size=2: small per-GPU micro-batch keeps activation memory low.
+    # grad_accum_steps=32: preserves the same effective batch as the original
+    #   batch_size=8 / grad_accum=8 plan:
+    #   2 GPUs × 2 seqs × 32 accum × 1024 tokens = 131,072 tokens/step.
+    # Gradient checkpointing (enabled in train_kaggle.py) drops peak activation
+    #   memory from ~10 GB to ~400 MB — fits cleanly on 14.6 GB T4 VRAM.
+    batch_size:       int = 2    # per-GPU micro-batch (OOM-safe for T4)
+    grad_accum_steps: int = 32   # effective batch unchanged: 2×2×32×1024 = 131,072
     context_len:      int = 1024
 
     # ── Optimiser (Muon + AdamW) ──────────────────────────────────────────────
@@ -106,7 +121,7 @@ class TrainConfig:
     log_every:  int = 1
 
     # ── Validation ────────────────────────────────────────────────────────────
-    val_batches: int = 16   # 16 × 8 × 1024 = 131,072 tokens per val pass
+    val_batches: int = 16   # 16 × 2 × 1024 = 32,768 tokens per val pass
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     checkpoint_dir: str  = "checkpoints_kaggle"

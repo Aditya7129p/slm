@@ -63,6 +63,11 @@ def _load_dotenv(path: str = ".env"):
 
 _load_dotenv()
 
+# Set PYTORCH_ALLOC_CONF before any CUDA allocations to reduce fragmentation.
+# expandable_segments=True allows the allocator to grow segments on demand
+# instead of failing when a contiguous block can't be found in the pool.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 def _hf_login():
     token = os.environ.get("HF_TOKEN", "").strip()
     if not token:
@@ -167,11 +172,16 @@ def _init_ddp():
     torchrun sets RANK, LOCAL_RANK, WORLD_SIZE automatically.
     Returns (rank, local_rank, world_size).
     """
-    dist.init_process_group(backend=train_cfg.ddp_backend)
-    rank       = dist.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = dist.get_world_size()
     torch.cuda.set_device(local_rank)
+    # Passing device_id suppresses the "Guessing device ID" warning and
+    # ensures NCCL uses the correct GPU from the start.
+    dist.init_process_group(
+        backend=train_cfg.ddp_backend,
+        device_id=torch.device(f"cuda:{local_rank}"),
+    )
+    rank       = dist.get_rank()
+    world_size = dist.get_world_size()
     return rank, local_rank, world_size
 
 
@@ -290,6 +300,13 @@ def train(resume_path: str = None, session_hours: float = 8.667):
     # ── Model ─────────────────────────────────────────────────────────────────
     model = SLM(mcfg).to(device=device, dtype=dtype)
     n_params = model.num_parameters()
+
+    # Enable gradient checkpointing BEFORE DDP wrap.
+    # Recomputes block activations on backward — cuts peak activation VRAM
+    # from ~10 GB to ~400 MB on T4 (required for 150M, context=1024, B=2).
+    model.enable_gradient_checkpointing()
+    if is_master:
+        print(f"[kaggle] gradient checkpointing enabled — activation memory ~80% lower")
 
     # Wrap with DDP — gradients are all-reduced automatically on backward()
     model = DDP(

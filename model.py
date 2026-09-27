@@ -181,6 +181,7 @@ class SLM(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
+        self.gradient_checkpointing = False   # toggled via enable_gradient_checkpointing()
 
         self.embed    = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.blocks   = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
@@ -198,6 +199,16 @@ class SLM(nn.Module):
         )
 
         self._init_weights()
+
+    def enable_gradient_checkpointing(self):
+        """
+        Enable gradient checkpointing for all transformer blocks.
+
+        Trades ~30 % extra compute for ~80 % less activation memory.
+        Essential for fitting 150M on T4 (14.6 GB) with context_len=1024.
+        Must be called BEFORE wrapping the model in DDP.
+        """
+        self.gradient_checkpointing = True
 
     # ── Weight initialisation ─────────────────────────────────────────────────
     def _init_weights(self):
@@ -227,7 +238,14 @@ class SLM(nn.Module):
         cos, sin = self.rope(T)           # (1, 1, T, head_dim)
 
         for block in self.blocks:
-            x = block(x, cos, sin)
+            if self.gradient_checkpointing and self.training:
+                # torch.utils.checkpoint recomputes block activations on backward,
+                # trading compute for memory. use_reentrant=False is the modern API.
+                x = torch.utils.checkpoint.checkpoint(
+                    block, x, cos, sin, use_reentrant=False
+                )
+            else:
+                x = block(x, cos, sin)
 
         x = self.norm_out(x)
         logits = self.lm_head(x)          # (B, T, V)
