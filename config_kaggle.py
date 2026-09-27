@@ -96,7 +96,7 @@ class TrainConfig:
     #   2 GPUs × 2 seqs × 32 accum × 1024 tokens = 131,072 tokens/step.
     # Gradient checkpointing (enabled in train_kaggle.py) drops peak activation
     #   memory from ~10 GB to ~400 MB — fits cleanly on 14.6 GB T4 VRAM.
-    batch_size:       int = 6    # per-GPU micro-batch (OOM-safe for T4)
+    batch_size:       int = 5    # per-GPU micro-batch (OOM-safe for T4)
     grad_accum_steps: int = 32   # effective batch unchanged: 2×2×32×1024 = 131,072
     context_len:      int = 1024
 
